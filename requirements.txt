@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic
+motor
+boto3
+python-dotenv
