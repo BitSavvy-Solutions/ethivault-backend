@@ -219,7 +219,7 @@ async def create_profile(
 
     now = utc_now_iso()
     doc = {
-        "profileId": "prof_" + uuid.uuid4().hex,
+        "profileId": "prof_" + uuid.uuid4().hex,  # server-generated
         "userId": user_id,
         "appId": body.appId,
         "name": body.name,
