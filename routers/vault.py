@@ -38,14 +38,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_QUOTA_BYTES = int(os.getenv("VAULT_DEFAULT_QUOTA_BYTES", str(500 * 1024 * 1024)))
 MAX_SNAPSHOT_BYTES = int(os.getenv("VAULT_MAX_SNAPSHOT_BYTES", str(50 * 1024 * 1024)))
+# CHANGED: The frontend treats one appId as one vault. The backend still
+# supports multiple profiles in general, but only one per (user, appId).
 MAX_PROFILES_PER_USER = int(os.getenv("VAULT_MAX_PROFILES_PER_USER", "10"))
 PRESIGN_TTL_SECONDS = int(os.getenv("VAULT_PRESIGN_TTL_SECONDS", "900"))
 RESERVATION_TTL_MINUTES = int(os.getenv("VAULT_RESERVATION_TTL_MINUTES", "15"))
-# How many previous snapshot versions to retain per profile for recovery.
 SNAPSHOT_HISTORY_KEEP = int(os.getenv("VAULT_SNAPSHOT_HISTORY_KEEP", "2"))
 ALLOWED_KDF_ALGOS = {"PBKDF2-SHA256", "ARGON2ID"}
 
-# Generous limit for the 60s version poll from clients.
 poll_limiter = SlidingWindowRateLimiter(
     int(os.getenv("VAULT_RATE_LIMIT_POLL_PER_HOUR", "360")), 3600
 )
@@ -137,19 +137,12 @@ class PresignRequest(BaseModel):
 class CommitRequest(BaseModel):
     reservationId: str = Field(min_length=1, max_length=128)
     baseVersion: int = Field(ge=0)
-    # Free-form label like "Chrome on Windows", set by the client, shown to
-    # other devices so users can tell where the last sync came from.
     deviceLabel: Optional[str] = Field(default=None, max_length=120)
 
 
 # ────────────────────────────── Helpers ─────────────────────────────
 
 async def _get_owned_profile(profile_id: str, user_id: str) -> dict:
-    """
-    Ownership check baked into the lookup. Returns 404 for both
-    'does not exist' and 'belongs to someone else', so the API
-    never leaks the existence of other users' profiles.
-    """
     if not _ID_RE.match(profile_id):
         raise HTTPException(status_code=404, detail="Profile not found")
 
@@ -210,6 +203,22 @@ async def create_profile(
 ):
     profiles = get_vault_profiles_collection()
 
+    # CHANGED: Enforce one vault per (user, appId). The frontend sends
+    # appId="aida" and expects a single vault. If one already exists,
+    # return 409 so the frontend can adopt it instead of creating a second.
+    existing = await profiles.find_one(
+        {"userId": user_id, "appId": body.appId},
+        {"_id": 0, "profileId": 1},
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "vault_already_exists",
+                "profileId": existing["profileId"],
+            },
+        )
+
     count = await profiles.count_documents({"userId": user_id})
     if count >= MAX_PROFILES_PER_USER:
         raise HTTPException(
@@ -219,7 +228,7 @@ async def create_profile(
 
     now = utc_now_iso()
     doc = {
-        "profileId": "prof_" + uuid.uuid4().hex,  # server-generated
+        "profileId": "prof_" + uuid.uuid4().hex,
         "userId": user_id,
         "appId": body.appId,
         "name": body.name,
@@ -276,6 +285,10 @@ async def update_profile(
         updates["kdf"] = body.kdf.model_dump()
         updates["wrappedDek"] = body.wrappedDek
         updates["verifier"] = body.verifier
+    # CHANGED: Only update wrappedDekRecovery when it is explicitly sent.
+    # The frontend password-change flow does not rotate the recovery key,
+    # so sending kdf+wrappedDek+verifier must not erase it.
+    if body.wrappedDekRecovery is not None:
         updates["wrappedDekRecovery"] = body.wrappedDekRecovery
 
     if not updates:
@@ -341,10 +354,6 @@ async def get_snapshot_meta(
     profile_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    """
-    Cheap polling endpoint. Devices call this on a timer to learn whether
-    another device committed a newer version, without minting presigned URLs.
-    """
     poll_limiter.check(user_id)
     profile = await _get_owned_profile(profile_id, user_id)
     s = profile.get("snapshot") or {}
@@ -524,8 +533,6 @@ async def commit_snapshot_upload(
             detail="Uploaded size does not match the reserved size. Restart the sync.",
         )
 
-    # Rotate: the previous live snapshot becomes history. This is the safety
-    # net if a client-side merge ever produces a bad result.
     history = list(profile.get("snapshotHistory") or [])
     if old_blob_key:
         history.insert(
@@ -571,8 +578,6 @@ async def commit_snapshot_upload(
             },
         )
 
-    # Usage delta: the old live blob is still stored (now as history), so the
-    # net change is the new blob size minus whatever history we just evicted.
     usage = get_vault_usage_collection()
     await usage.update_one(
         {"userId": user_id},
@@ -619,11 +624,6 @@ async def get_snapshot_download(
     version: Optional[int] = None,
     user_id: str = Depends(get_current_user_id),
 ):
-    """
-    Mints a presigned download URL. Without ?version= returns the live
-    snapshot. With ?version=N returns a retained historical version, which is
-    the recovery path if a merge ever goes wrong client-side.
-    """
     profile = await _get_owned_profile(profile_id, user_id)
     snapshot = profile.get("snapshot") or {}
     current_version = int(snapshot.get("version", 0))
